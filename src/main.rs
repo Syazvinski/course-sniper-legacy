@@ -20,7 +20,7 @@ use args::SniperArgs;
 mod ascii;
 mod elements;
 
-const TIMEOUT: u64 = 20;
+const TIMEOUT: u64 = 120;
 
 #[async_std::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
