@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - build: windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            friendly_name: windows-x64
+            extension: .exe
+            readme: README-windows.md
+
+          - build: linux
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            friendly_name: linux-x64
+            extension: ""
+            readme: README-linux.md
+
+          - build: macos
+            os: macos-latest
+            target: x86_64-apple-darwin
+            friendly_name: macos-x64
+            extension: ""
+            readme: README-macos-x64.md
+
+          - build: macos-arm
+            os: macos-latest
+            target: aarch64-apple-darwin
+            friendly_name: macos-arm64
+            extension: ""
+            readme: README-macos-arm64.md
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare release asset
+        shell: bash
+        run: |
+          # get binary name
+          binary_name=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].targets[0].name')
+
+          # temp dir for the zip
+          mkdir -p "tmp_zip"
+
+          # copy binary to zip dir with correct name
+          cp "target/${{ matrix.target }}/release/$binary_name${{ matrix.extension }}" \
+             "tmp_zip/$binary_name${{ matrix.extension }}"
+
+          # checksum for binary
+          cd tmp_zip
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            certutil -hashfile "$binary_name${{ matrix.extension }}" SHA256 > checksum.sha256
+          else
+            shasum -a 256 "$binary_name${{ matrix.extension }}" > checksum.sha256
+          fi
+
+          # put README
+          cp "../release-docs/${{ matrix.readme }}" README.md
+          sed -i.bak "s/BINARY_NAME/$binary_name/g" README.md
+          rm -f README.md.bak
+
+          cd ..
+
+          mkdir -p release
+
+          # create zip
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            7z a "release/$binary_name-${{ matrix.friendly_name }}.zip" ./tmp_zip/*
+          else
+            zip -j "release/$binary_name-${{ matrix.friendly_name }}.zip" tmp_zip/*
+          fi
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          # create release
+          gh release create ${{ github.ref_name }} --notes="Release ${{ github.ref_name }}" || true
+
+          # upload
+          gh release upload ${{ github.ref_name }} release/*.zip --clobber
