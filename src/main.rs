@@ -2,6 +2,7 @@ use async_std::task::sleep;
 use chromiumoxide::error::CdpError;
 use chromiumoxide::page::ScreenshotParams;
 use chromiumoxide::{Browser, BrowserConfig, Element, Page};
+use chromiumoxide::cdp::js_protocol::runtime::{CallFunctionOnParams, CallArgument};
 use chrono::{Local, Timelike};
 use clap::Parser;
 use core::fmt;
@@ -175,6 +176,15 @@ async fn run(page: &Page, elements: EmoryPageElements) -> Result<(), Box<dyn std
 
     // pick validate or enroll
     if Select::new("Select action:", vec!["Validate", "Enroll"]).prompt()? == "Enroll" {
+        let method_choice = Select::new(
+            "Choose enrollment method:",
+            vec![
+                "Legacy (click buttons)",
+                "Fast (direct form POST)",
+            ],
+        )
+        .prompt()?;
+        let use_fast = method_choice.starts_with("Fast");
         //TODO improve registration time selection and implimentation
         let registration_times: Vec<RegistrationTime> = (1..=12)
             .flat_map(|hour| {
@@ -222,42 +232,46 @@ async fn run(page: &Page, elements: EmoryPageElements) -> Result<(), Box<dyn std
             "Page finished loading at {}",
             Local::now().format("%H:%M:%S.%3f")
         );
-        let pb = get_progress_bar("Selecting courses...");
-        for (index, checkbox) in wait_elements_agressive_retry(&page, elements.checkboxes, TIMEOUT)
-            .await?
-            .into_iter()
-            .enumerate()
-        {
-            if selected_courses
-                .iter()
-                .any(|course| course.checkbox_index == index as u8)
+        if use_fast {
+            // Fast method: perform two-step POST directly with current form state
+            println!("FastForm: building selection + sending requests at {}", Local::now().format("%H:%M:%S.%3f"));
+            let idxs: Vec<u32> = selected_courses.iter().map(|c| c.checkbox_index as u32).collect();
+            fast_form_enroll(&page, &elements, &idxs).await?;
+            println!("FastForm: confirm completed at {}", Local::now().format("%H:%M:%S.%3f"));
+            // Reload to reflect results in DOM before scraping
+            page.reload().await?.wait_for_navigation().await?;
+            println!("FastForm: reloaded to capture results at {}", Local::now().format("%H:%M:%S.%3f"));
+        } else {
+            // Legacy path: select via checkboxes and click through UI
+            let pb = get_progress_bar("Selecting courses...");
+            for (index, checkbox) in wait_elements_agressive_retry(&page, elements.checkboxes, TIMEOUT)
+                .await?
+                .into_iter()
+                .enumerate()
             {
-                checkbox.click().await?;
+                if selected_courses
+                    .iter()
+                    .any(|course| course.checkbox_index == index as u8)
+                {
+                    checkbox.click().await?;
+                }
             }
+            pb.finish_with_message("Courses selected.");
+
+            // enroll button
+            wait_element_agressive_retry(&page, elements.enroll_button, TIMEOUT)
+                .await?
+                .click()
+                .await?;
+            println!("Enroll clicked at {}", Local::now().format("%H:%M:%S.%3f").to_string());
+
+            // confirm
+            wait_element_agressive_retry(&page, &elements.enroll_confirm_button, TIMEOUT)
+                .await?
+                .click()
+                .await?;
+            println!("Confirm clicked at {}", Local::now().format("%H:%M:%S.%3f").to_string());
         }
-        pb.finish_with_message("Courses selected.");
-
-        // enroll
-        wait_element_agressive_retry(&page, elements.enroll_button, TIMEOUT)
-            .await?
-            .click()
-            .await?;
-
-        println!(
-            "Enroll clicked at {}",
-            Local::now().format("%H:%M:%S.%3f").to_string()
-        );
-
-        // confirm
-        wait_element_agressive_retry(&page, &elements.enroll_confirm_button, TIMEOUT)
-            .await?
-            .click()
-            .await?;
-
-        println!(
-            "Confirm clicked at {}",
-            Local::now().format("%H:%M:%S.%3f").to_string()
-        );
 
         // results
         let pb = get_progress_bar("Waiting for enrollment results...");
@@ -305,6 +319,61 @@ async fn run(page: &Page, elements: EmoryPageElements) -> Result<(), Box<dyn std
         println!("{}", registration_results.to_table());
     }
 
+    Ok(())
+}
+
+// Performs 2-step POST (Enroll then Confirm) using current form state.
+async fn fast_form_enroll(
+    page: &Page,
+    _elements: &EmoryPageElements,
+    selected_indexes: &Vec<u32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let func = r#"
+        async function(idxs){
+            try{
+                const form = document.querySelector('form[name^="win"]') || document.forms[0];
+                if(!form) return {ok:false,error:'form not found'};
+                const postUrl = form.action;
+                const params = new URLSearchParams(new FormData(form));
+
+                // Select each target row
+                (idxs||[]).forEach(i=> params.set('DERIVED_REGFRM1_SSR_SELECT$'+i,'Y'));
+
+                params.set('ICAction','DERIVED_SSR_FL_SSR_ENROLL_FL');
+                params.set('ICXPos','0');
+                params.set('ICYPos','0');
+
+                const enrollResp = await fetch(postUrl, {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: params.toString(), credentials:'include'});
+                const enrollText = await enrollResp.text();
+                const m = (enrollText||'').match(/name=['\"]ICStateNum['\"]\s*value=['\"](\d+)/);
+                if(!m) return {ok:false,error:'state parse failed'};
+                params.set('ICStateNum', m[1]);
+                params.set('ICAction', '#ICYes');
+
+                const confirmResp = await fetch(postUrl, {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: params.toString(), credentials:'include'});
+                const confirmText = await confirmResp.text();
+                return {ok:true, bytes: confirmText.length};
+            }catch(err){
+                return {ok:false,error:String(err)};
+            }
+        }
+    "#;
+
+    let call = CallFunctionOnParams::builder()
+        .function_declaration(func)
+        .argument(
+            CallArgument::builder()
+                .value(serde_json::json!(selected_indexes))
+                .build(),
+        )
+        .build()
+        .map_err(|e| format!("build js call: {e}"))?;
+
+    let v: serde_json::Value = page.evaluate_function(call).await?.into_value()?;
+    if !v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+        let err = v.get("error").and_then(|x| x.as_str()).unwrap_or("unknown");
+        return Err(format!("FastForm failed: {err}").into());
+    }
     Ok(())
 }
 
